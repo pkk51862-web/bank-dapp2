@@ -8,35 +8,50 @@ const CONTRACT_ABI = [
     "event Withdraw(address indexed owner, uint256 amount)"
 ];
 
-// Infura connection for reading blockchain data
 const INFURA_URL =
     "https://sepolia.infura.io/v3/f62c6f06d3544b67ad90cded25c922e0";
 
 const SEPOLIA_CHAIN_ID = 11155111n;
 
-const infuraProvider = new ethers.JsonRpcProvider(INFURA_URL);
+// Set a timeout so failed connection checks do not wait indefinitely.
+const infuraRequest = new ethers.FetchRequest(INFURA_URL);
+infuraRequest.timeout = 15000;
 
+// Disable batching to keep each connection check straightforward.
+const infuraProvider = new ethers.JsonRpcProvider(
+    infuraRequest,
+    undefined,
+    { batchMaxCount: 1 }
+);
+
+// Read-only contract: requests go through Infura.
 const readContract = new ethers.Contract(
     CONTRACT_ADDRESS,
     CONTRACT_ABI,
     infuraProvider
 );
 
-// MetaMask connection for signing transactions
+// Transaction contract: requests go through MetaMask.
 let provider;
 let signer;
 let contract;
 
+let busy = false;
+let checkingInfura = false;
+
+// Elements
 const connectButton = document.getElementById("connectButton");
 const checkBalanceButton = document.getElementById("checkBalanceButton");
 const walletAddress = document.getElementById("walletAddress");
 const balanceDisplay = document.getElementById("balance");
 const statusMessage = document.getElementById("statusMessage");
 
+const infuraStatus = document.getElementById("infuraStatus");
+const infuraDetails = document.getElementById("infuraDetails");
+const retryInfuraButton = document.getElementById("retryInfuraButton");
+
 const depositForm = document.getElementById("depositForm");
 const withdrawForm = document.getElementById("withdrawForm");
-
-let busy = false;
 
 function showStatus(message, type = "secondary") {
     statusMessage.textContent = message;
@@ -48,6 +63,7 @@ function setBusy(value) {
 
     connectButton.disabled = value;
     checkBalanceButton.disabled = value;
+
     depositForm.querySelector("button").disabled = value;
     withdrawForm.querySelector("button").disabled = value;
 }
@@ -67,25 +83,77 @@ function getErrorMessage(error) {
         "Something went wrong.";
 }
 
+function markInfuraConnected(details) {
+    infuraStatus.textContent = "Connected · Sepolia";
+    infuraStatus.className = "badge text-bg-success";
+
+    infuraDetails.textContent =
+        `${details} Last successful check: ` +
+        new Date().toLocaleTimeString();
+}
+
+function markInfuraFailed(error) {
+    infuraStatus.textContent = "Connection failed";
+    infuraStatus.className = "badge text-bg-danger";
+
+    infuraDetails.textContent = getErrorMessage(error);
+}
+
+// Check Infura independently of MetaMask.
+async function checkInfuraConnection() {
+    if (checkingInfura) return;
+
+    checkingInfura = true;
+    retryInfuraButton.disabled = true;
+
+    infuraStatus.textContent = "Checking...";
+    infuraStatus.className = "badge text-bg-secondary";
+    infuraDetails.textContent = "Checking the blockchain endpoint...";
+
+    try {
+        const chainId = await infuraProvider.send("eth_chainId", []);
+
+        if (BigInt(chainId) !== SEPOLIA_CHAIN_ID) {
+            throw new Error(
+                "The Infura endpoint is not connected to Ethereum Sepolia."
+            );
+        }
+
+        const blockHex = await infuraProvider.send(
+            "eth_blockNumber",
+            []
+        );
+
+        const blockNumber = BigInt(blockHex).toLocaleString();
+
+        markInfuraConnected(`Latest block: ${blockNumber}.`);
+    } catch (error) {
+        markInfuraFailed(error);
+    } finally {
+        checkingInfura = false;
+        retryInfuraButton.disabled = false;
+    }
+}
+
 async function requireConnectedWallet() {
     if (!signer || !contract) {
         throw new Error("Please connect MetaMask first.");
     }
 
-    // Query MetaMask directly to confirm the current network.
     const chainId = await window.ethereum.request({
         method: "eth_chainId"
     });
 
     if (BigInt(chainId) !== SEPOLIA_CHAIN_ID) {
-        throw new Error("Please switch MetaMask to the Sepolia network.");
+        throw new Error(
+            "Please switch MetaMask to the Sepolia network."
+        );
     }
 }
 
 function getAmount(inputId) {
     const input = document.getElementById(inputId).value.trim();
 
-    // Accept ordinary decimal ETH amounts with up to 18 decimal places.
     if (!/^\d+(\.\d{1,18})?$/.test(input)) {
         throw new Error(
             "Enter a valid ETH amount with up to 18 decimal places."
@@ -101,17 +169,27 @@ function getAmount(inputId) {
     return amountWei;
 }
 
-// Read the connected user's bank balance through Infura.
-// Setting "from" supplies msg.sender for checkBlance().
+// Read through Infura, supplying the connected account as msg.sender.
 async function loadBankBalance() {
     const address = await signer.getAddress();
 
-    const balanceWei = await readContract.checkBlance({
-        from: address
-    });
+    let balanceWei;
+
+    try {
+        balanceWei = await readContract.checkBlance({
+            from: address
+        });
+    } catch (error) {
+        // Probe the endpoint separately: a contract error does not
+        // necessarily mean that the Infura connection failed.
+        void checkInfuraConnection();
+        throw error;
+    }
 
     balanceDisplay.textContent =
         `${ethers.formatEther(balanceWei)} ETH`;
+
+    markInfuraConnected("Bank balance read successfully.");
 
     return balanceWei;
 }
@@ -141,7 +219,7 @@ async function connectWallet() {
 
         if (BigInt(chainId) !== SEPOLIA_CHAIN_ID) {
             throw new Error(
-                "Please switch MetaMask to the Sepolia network, then connect again."
+                "Please switch MetaMask to Sepolia, then connect again."
             );
         }
 
@@ -156,6 +234,7 @@ async function connectWallet() {
         const address = await signer.getAddress();
 
         walletAddress.textContent = address;
+
         connectButton.textContent =
             `${address.slice(0, 6)}...${address.slice(-4)}`;
 
@@ -167,7 +246,6 @@ async function connectWallet() {
             "info"
         );
 
-        // An Infura error should not imply the wallet failed to connect.
         try {
             await loadBankBalance();
 
@@ -177,9 +255,8 @@ async function connectWallet() {
             );
         } catch (error) {
             showStatus(
-                `Wallet connected, but Infura balance loading failed: ${
-                    getErrorMessage(error)
-                }`,
+                "Wallet connected, but bank balance loading failed: " +
+                getErrorMessage(error),
                 "warning"
             );
         }
@@ -203,7 +280,10 @@ async function checkBalance() {
 
         await loadBankBalance();
 
-        showStatus("Balance loaded through Infura.", "success");
+        showStatus(
+            "Balance loaded through Infura.",
+            "success"
+        );
     } catch (error) {
         showStatus(getErrorMessage(error), "danger");
     } finally {
@@ -211,13 +291,12 @@ async function checkBalance() {
     }
 }
 
-// Refresh after confirmation without reporting a successful transaction
-// as failed if Infura cannot load the updated balance.
 async function showConfirmedTransaction(action, form) {
     form.reset();
 
     try {
         await loadBankBalance();
+
         showStatus(`${action} successful!`, "success");
     } catch (error) {
         showStatus(
@@ -241,7 +320,10 @@ async function deposit(event) {
 
         const amountWei = getAmount("depositAmount");
 
-        showStatus("Confirm the deposit in MetaMask...", "info");
+        showStatus(
+            "Confirm the deposit in MetaMask...",
+            "info"
+        );
 
         const tx = await contract.deposit({
             value: amountWei
@@ -254,7 +336,10 @@ async function deposit(event) {
 
         await tx.wait();
 
-        await showConfirmedTransaction("Deposit", depositForm);
+        await showConfirmedTransaction(
+            "Deposit",
+            depositForm
+        );
     } catch (error) {
         showStatus(getErrorMessage(error), "danger");
     } finally {
@@ -275,7 +360,10 @@ async function withdraw(event) {
 
         const amountWei = getAmount("withdrawAmount");
 
-        showStatus("Confirm the withdrawal in MetaMask...", "info");
+        showStatus(
+            "Confirm the withdrawal in MetaMask...",
+            "info"
+        );
 
         const tx = await contract.withdraw(amountWei);
 
@@ -286,7 +374,10 @@ async function withdraw(event) {
 
         await tx.wait();
 
-        await showConfirmedTransaction("Withdrawal", withdrawForm);
+        await showConfirmedTransaction(
+            "Withdrawal",
+            withdrawForm
+        );
     } catch (error) {
         showStatus(getErrorMessage(error), "danger");
     } finally {
@@ -294,13 +385,23 @@ async function withdraw(event) {
     }
 }
 
-// Events
+// Button and form events
 connectButton.addEventListener("click", connectWallet);
-checkBalanceButton.addEventListener("click", checkBalance);
+
+checkBalanceButton.addEventListener(
+    "click",
+    checkBalance
+);
+
+retryInfuraButton.addEventListener(
+    "click",
+    checkInfuraConnection
+);
 
 depositForm.addEventListener("submit", deposit);
 withdrawForm.addEventListener("submit", withdraw);
 
+// Refresh when the wallet account or network changes.
 if (window.ethereum) {
     window.ethereum.on("accountsChanged", () => {
         window.location.reload();
@@ -310,3 +411,8 @@ if (window.ethereum) {
         window.location.reload();
     });
 }
+
+// Check Infura on page load and every 30 seconds.
+checkInfuraConnection();
+
+setInterval(checkInfuraConnection, 30000);

@@ -73,8 +73,16 @@ body {
     font-weight: 500;
 }
 
-#statusMessage {
+#statusMessage,
+#infuraDetails {
     overflow-wrap: anywhere;
+}
+
+#infuraStatus {
+    font-size: 0.8rem;
+    padding: 0.5em 0.75em;
+    white-space: normal;
+    text-align: left;
 }
 
 @media (max-width: 576px) {
